@@ -2,41 +2,38 @@ import json
 import boto3
 import re
 import math
+import os
+import uuid
+from datetime import datetime
 from collections import Counter
 
 bedrock = boto3.client('bedrock-runtime')
+s3 = boto3.client("s3")
+bucket_name = os.environ.get("S3_BUCKET_NAME")
 
-def extract_java_code(text):
-    match = re.search(r'```java(.*?)```', text, re.DOTALL)
+def extract_code_block(text, language=None):
+    if not text:
+        return ""
+    match = re.search(r"Code:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
-    match = re.search(r'```(.*?)```', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    if language:
+        pattern = rf"```{language}(.*?)```"
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    fallback = re.search(r"```(.*?)```", text, re.DOTALL)
+    if fallback:
+        return fallback.group(1).strip()
     return text.strip()
-
-def cosine_sim(text1, text2):
-    vec1 = Counter(text1.split())
-    vec2 = Counter(text2.split())
-    dot = sum(vec1[x] * vec2[x] for x in vec1 & vec2)
-    mag1 = math.sqrt(sum(v**2 for v in vec1.values()))
-    mag2 = math.sqrt(sum(v**2 for v in vec2.values()))
-    return dot / (mag1 * mag2) if mag1 and mag2 else 0.0
 
 def get_bedrock_response(model_id, prompt):
     if model_id.startswith("anthropic.claude"):
         body = json.dumps({
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 800,
+            "max_tokens": 1024,
             "temperature": 0.7,
             "anthropic_version": "bedrock-2023-05-31"
-        })
-    elif model_id.startswith("meta.llama3"):
-        body = json.dumps({
-            "prompt": prompt,
-            "max_gen_len": 800,
-            "temperature": 0.7,
-            "top_p": 0.9
         })
     else:
         raise ValueError("Unsupported model_id")
@@ -49,44 +46,85 @@ def get_bedrock_response(model_id, prompt):
     )
     result = json.loads(response['body'].read())
 
-    if model_id.startswith("anthropic.claude"):
+    try:
         return result["content"][0]["text"]
-    elif model_id.startswith("meta.llama3"):
-        return result.get("generation", "")
-    return ""
+    except Exception as e:
+        print("Claude model response error:", result)
+        return ""
 
 def lambda_handler(event, context):
-    source_code = event.get("source_code")
-    if not source_code:
-        return {
-            "statusCode": 400,
-            "message": "Missing 'source_code' in request"
-        }
+    try:
+        body = json.loads(event["body"]) if "body" in event else event
 
-    prompt = f"Convert the following Python code to Java:\n\n```python\n{source_code}\n```"
+        source_code = body.get("sourceCode")
+        source_lang = body.get("sourceLang", "").strip().lower()
+        target_lang = body.get("targetLang", "").strip().lower()
+        user_id = body.get("UserID", "").strip()
+        timestamp = datetime.utcnow().isoformat()
+        date_path = datetime.utcnow().strftime("%Y-%m-%d")
 
-    model_claude = "anthropic.claude-3-sonnet-20240229-v1:0"
-    model_llama = "meta.llama3-70b-instruct-v1:0" 
+        if not all([source_code, source_lang, target_lang, user_id]):
+            return {
+                "statusCode": 400,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({"message": "Missing one or more required fields."})
+            }
 
-    response_claude = get_bedrock_response(model_claude, prompt)
-    response_llama = get_bedrock_response(model_llama, prompt)
+        prompt = (
+            f"Convert the following {source_lang} code to {target_lang}:\n\n"
+            f"```{source_lang}\n{source_code}\n```\n\n"
+            f"Please reply with only the converted code, and prefix it with 'Code:'."
+        )
 
-    java_claude = extract_java_code(response_claude)
-    java_llama = extract_java_code(response_llama)
+        model_claude = "anthropic.claude-3-sonnet-20240229-v1:0"
+        response_claude = get_bedrock_response(model_claude, prompt)
 
-    similarity = cosine_sim(java_claude, java_llama)
+        if not response_claude:
+            raise ValueError("Claude response was empty.")
 
-    if similarity > 0.8:
+        converted_code = extract_code_block(response_claude, target_lang)
+
+        # Generate key in format: user_id/yyyy-mm-dd/user_id_timestamp_targetlang_uuid.txt
+        file_name = f"{user_id}_{timestamp}_{target_lang}_{uuid.uuid4().hex}.txt"
+        file_key = f"{user_id}/{date_path}/{file_name}"
+
+        file_content = (
+            f"UserID: {user_id}\n"
+            f"Timestamp: {timestamp}\n"
+            f"TargetLang: {target_lang}\n"
+            f"Code:\n{converted_code}"
+        )
+
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=file_key,
+            Body=file_content.encode("utf-8")
+        )
+
         return {
             "statusCode": 200,
-            "similarity": similarity,
-            "java_code": java_claude
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({
+                "converted_code": converted_code,
+                "s3_key": file_key
+            })
         }
-    else:
+
+    except Exception as e:
         return {
-            "statusCode": 400,
-            "message": "Similarity too low",
-            "similarity": similarity,
-            "java_claude": java_claude,
-            "java_llama": java_llama
+            "statusCode": 500,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({
+                "message": "Internal error",
+                "error": str(e)
+            })
         }
+'''
+# TEST EVENT:
+{
+    "sourceLang": "python",
+    "targetLang": "java",
+    "sourceCode": "def greet():\n    print('Hello')",
+    "UserID": "user123"
+}
+'''
