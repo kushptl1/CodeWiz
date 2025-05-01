@@ -13,24 +13,6 @@ Transform your code into cleaner, more efficient solutions with the power of AI.
 
 ---
 
-## 🛠️ Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/kushptl1/CodeWiz.git
-   cd CodeWiz
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Start the application:
-   ```bash
-   npm start
-   ```
-
----
-
 ## 📖 Usage
 
 ### Basic Example
