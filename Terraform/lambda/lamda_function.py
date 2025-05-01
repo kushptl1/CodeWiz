@@ -1,15 +1,18 @@
 import json
 import boto3
 import re
-import math
 import os
 import uuid
 from datetime import datetime
-from collections import Counter
 
+# AWS clients
 bedrock = boto3.client('bedrock-runtime')
 s3 = boto3.client("s3")
+dynamodb = boto3.client("dynamodb")
+
+# Environment variables
 bucket_name = os.environ.get("S3_BUCKET_NAME")
+dynamodb_table = os.environ.get("DYNAMODB_TABLE")
 
 def extract_code_block(text, language=None):
     if not text:
@@ -45,12 +48,24 @@ def get_bedrock_response(model_id, prompt):
         contentType="application/json"
     )
     result = json.loads(response['body'].read())
-
     try:
         return result["content"][0]["text"]
     except Exception as e:
         print("Claude model response error:", result)
         return ""
+
+def log_to_dynamodb(log_id, user_id, timestamp):
+    try:
+        dynamodb.put_item(
+            TableName=dynamodb_table,
+            Item={
+                "LogID": {"S": log_id},
+                "UserID": {"S": user_id},
+                "Timestamp": {"S": timestamp}
+            }
+        )
+    except Exception as e:
+        print("Error writing to DynamoDB:", e)
 
 def lambda_handler(event, context):
     try:
@@ -84,22 +99,24 @@ def lambda_handler(event, context):
 
         converted_code = extract_code_block(response_claude, target_lang)
 
-        # Generate key in format: user_id/yyyy-mm-dd/user_id_timestamp_targetlang_uuid.txt
-        file_name = f"{user_id}_{timestamp}_{target_lang}_{uuid.uuid4().hex}.txt"
+        # Save to S3
+        log_id = str(uuid.uuid4())
+        file_name = f"{user_id}_{timestamp}_{target_lang}_{log_id}.txt"
         file_key = f"{user_id}/{date_path}/{file_name}"
-
         file_content = (
             f"UserID: {user_id}\n"
             f"Timestamp: {timestamp}\n"
             f"TargetLang: {target_lang}\n"
             f"Code:\n{converted_code}"
         )
-
         s3.put_object(
             Bucket=bucket_name,
             Key=file_key,
             Body=file_content.encode("utf-8")
         )
+
+        # Save to DynamoDB
+        log_to_dynamodb(log_id, user_id, timestamp)
 
         return {
             "statusCode": 200,
@@ -119,6 +136,8 @@ def lambda_handler(event, context):
                 "error": str(e)
             })
         }
+
+
 '''
 # TEST EVENT:
 {
