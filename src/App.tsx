@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Code2, Upload, Sparkles, ArrowRight, X } from 'lucide-react';
 import Editor from '@monaco-editor/react';
+import { getAuth, signInWithPopup, signOut } from 'firebase/auth';
+import { auth, provider } from './config/firebase-config';  // Import Firebase configuration
 
 const LANGUAGES = [
   'choose your language',
@@ -58,7 +60,9 @@ function App() {
   const [targetLang, setTargetLang] = useState('choose your language');
   const [refactoredCode, setRefactoredCode] = useState('');
   const [showErrorModal, setShowErrorModal] = useState(false);
+  const [user, setUser] = useState(null);  // Track logged-in user
 
+  // Helper function to handle errors
   const handleError = () => {
     if (sourceLang === 'choose your language' || targetLang === 'choose your language') {
       setShowErrorModal(true);
@@ -67,6 +71,25 @@ function App() {
     return false;
   };
 
+  // Google Login handler
+  const handleLogin = async () => {
+    try {
+      const result = await signInWithPopup(auth, provider);
+      const user = result.user;
+      setUser(user);  // Set the logged-in user
+    } catch (error) {
+      console.error("Error logging in with Google: ", error);
+    }
+  };
+
+  // Google Logout handler
+  const handleLogout = () => {
+    signOut(auth)
+      .then(() => setUser(null))  // Clear the user state after logout
+      .catch((error) => console.log("Error logging out: ", error));
+  };
+
+  // Handle refactoring
   const handleRefactor = async () => {
     if (handleError()) return;
 
@@ -77,6 +100,7 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          userId: user?.uid,  // Send the user ID or email along with the other data
           sourceLang,
           targetLang,
           code: sourceCode,
@@ -106,6 +130,29 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-[#0f1729] to-gray-900 text-white">
+      {/* Authentication */}
+      <div className="absolute top-4 right-4 z-50">
+        {user ? (
+          <div className="p-4 text-green-400">
+            <span>Welcome, {user.displayName}</span>
+            <button
+              onClick={handleLogout}
+              className="ml-4 px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-500"
+            >
+              Logout
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={handleLogin}
+            className="px-8 py-4 bg-gradient-to-r from-purple-500 to-blue-500 rounded-lg font-semibold flex items-center gap-2 hover:opacity-90 transition-opacity"
+            style={{ zIndex: 100 }}
+          >
+            Sign in with Google
+          </button>
+        )}
+      </div>
+
       {/* Hero Section */}
       <div className="relative overflow-hidden">
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#80808012_1px,transparent_1px),linear-gradient(to_bottom,#80808012_1px,transparent_1px)] bg-[size:24px_24px]"></div>
@@ -134,10 +181,12 @@ function App() {
                 Try Now
                 <ArrowRight className="w-5 h-5" />
               </button>
-              
+
+              {/* Disable the button if the user is not logged in */}
               <button
                 onClick={() => setShowEditor(true)}
-                className="px-8 py-4 bg-gray-800 rounded-lg font-semibold flex items-center gap-2 hover:bg-gray-700 transition-colors border border-gray-700"
+                className={`px-8 py-4 bg-gray-800 rounded-lg font-semibold flex items-center gap-2 hover:bg-gray-700 transition-colors border border-gray-700 ${!user ? 'cursor-not-allowed opacity-50' : ''}`}
+                disabled={!user} // Disable if the user is not signed in
               >
                 <Upload className="w-5 h-5" />
                 Upload Code
