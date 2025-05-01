@@ -2,7 +2,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# Zip the lambda_function.py
+# Lambda ZIP packaging
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = "${path.module}/lambda"
@@ -13,7 +13,7 @@ resource "random_id" "suffix" {
   byte_length = 4
 }
 
-# VPC Setup
+# VPC and Subnets
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
 }
@@ -49,9 +49,10 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public.id
 }
 
+# Security Group for EC2 and Lambda
 resource "aws_security_group" "lambda_sg" {
   name        = "lambda-sg"
-  description = "Allow Lambda and SSH access"
+  description = "Allow SSH"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -69,7 +70,7 @@ resource "aws_security_group" "lambda_sg" {
   }
 }
 
-# DynamoDB Table
+# DynamoDB
 resource "aws_dynamodb_table" "lambda_logs" {
   name         = "lambda-logs"
   billing_mode = "PAY_PER_REQUEST"
@@ -79,58 +80,52 @@ resource "aws_dynamodb_table" "lambda_logs" {
     name = "LogID"
     type = "S"
   }
-
-  tags = {
-    Name = "LambdaLogsTable"
-  }
 }
 
-# VPC Gateway Endpoint for S3
-resource "aws_vpc_endpoint" "s3_endpoint" {
-  vpc_id          = aws_vpc.main.id
-  service_name    = "com.amazonaws.us-east-1.s3"
-  route_table_ids = [aws_route_table.public.id]
-}
-
-# S3 Bucket for converted code
+# S3 + VPC Endpoint
 resource "aws_s3_bucket" "converted_code_bucket" {
-  bucket         = "lambda-code-output-${random_id.suffix.hex}"
-  force_destroy  = true
+  bucket        = "lambda-code-output"
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "block" {
   bucket = aws_s3_bucket.converted_code_bucket.id
-
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
-# IAM Role for Lambda Execution
+resource "aws_vpc_endpoint" "s3_endpoint" {
+  vpc_id          = aws_vpc.main.id
+  service_name    = "com.amazonaws.us-east-1.s3"
+  route_table_ids = [aws_route_table.public.id]
+}
+
+# Lambda IAM Role
 resource "aws_iam_role" "lambda_exec_role" {
-  name = "lambda-basic-execution"
+  name = "lambda-exec-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
       {
-        Action = "sts:AssumeRole",
         Effect = "Allow",
         Principal = {
           Service = "lambda.amazonaws.com"
-        }
+        },
+        Action = "sts:AssumeRole"
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_logs" {
+resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_exec_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_iam_role_policy" "lambda_invoke" {
+resource "aws_iam_role_policy" "lambda_custom" {
   name = "lambda-policy"
   role = aws_iam_role.lambda_exec_role.id
 
@@ -139,8 +134,8 @@ resource "aws_iam_role_policy" "lambda_invoke" {
     Statement = [
       {
         Effect = "Allow",
-        Action = ["bedrock:InvokeModel"],
-        Resource = "arn:aws:bedrock:us-east-1::foundation-model/*"
+        Action = ["s3:PutObject"],
+        Resource = "${aws_s3_bucket.converted_code_bucket.arn}/*"
       },
       {
         Effect = "Allow",
@@ -149,8 +144,8 @@ resource "aws_iam_role_policy" "lambda_invoke" {
       },
       {
         Effect = "Allow",
-        Action = ["s3:PutObject"],
-        Resource = "${aws_s3_bucket.converted_code_bucket.arn}/*"
+        Action = ["bedrock:InvokeModel"],
+        Resource = "*"
       }
     ]
   })
@@ -164,7 +159,6 @@ resource "aws_lambda_function" "my_lambda" {
   handler       = "lambda_function.lambda_handler"
   runtime       = "python3.11"
   role          = aws_iam_role.lambda_exec_role.arn
-  timeout       = 30
 
   environment {
     variables = {
@@ -174,10 +168,16 @@ resource "aws_lambda_function" "my_lambda" {
   }
 }
 
-# API Gateway to expose Lambda
+# API Gateway HTTP API
 resource "aws_apigatewayv2_api" "lambda_api" {
   name          = "lambda-api"
   protocol_type = "HTTP"
+
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["POST", "OPTIONS"]
+    allow_headers = ["Content-Type", "Authorization"]
+  }
 }
 
 resource "aws_lambda_permission" "apigw_invoke" {
@@ -208,46 +208,42 @@ resource "aws_apigatewayv2_stage" "lambda_stage" {
   auto_deploy = true
 }
 
-# IAM Role and Policy for EC2 to access S3
+# EC2 IAM Role for S3 access
 resource "aws_iam_role" "bastion_role" {
-  name = "ec2-bastion-role"
+  name = "bastion-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        },
-        Action = "sts:AssumeRole"
-      }
-    ]
+    Statement = [{
+      Effect = "Allow",
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      },
+      Action = "sts:AssumeRole"
+    }]
   })
 }
 
-resource "aws_iam_instance_profile" "bastion_profile" {
-  name = "bastion-instance-profile"
-  role = aws_iam_role.bastion_role.name
-}
-
-resource "aws_iam_role_policy" "bastion_s3_access" {
-  name = "bastion-s3-access"
+resource "aws_iam_role_policy" "bastion_s3" {
+  name = "bastion-s3-policy"
   role = aws_iam_role.bastion_role.id
 
   policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = ["s3:GetObject", "s3:ListBucket"],
-        Resource = [
-          aws_s3_bucket.converted_code_bucket.arn,
-          "${aws_s3_bucket.converted_code_bucket.arn}/*"
-        ]
-      }
-    ]
+    Statement = [{
+      Effect = "Allow",
+      Action = ["s3:ListBucket", "s3:GetObject"],
+      Resource = [
+        aws_s3_bucket.converted_code_bucket.arn,
+        "${aws_s3_bucket.converted_code_bucket.arn}/*"
+      ]
+    }]
   })
+}
+
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "bastion-profile"
+  role = aws_iam_role.bastion_role.name
 }
 
 # EC2 Bastion Host
@@ -255,9 +251,9 @@ resource "aws_instance" "bastion" {
   ami                         = "ami-0c02fb55956c7d316"
   instance_type               = "t2.micro"
   subnet_id                   = aws_subnet.public_subnet.id
-  vpc_security_group_ids      = [aws_security_group.lambda_sg.id]
   associate_public_ip_address = true
   key_name                    = "bastion-key"
+  vpc_security_group_ids      = [aws_security_group.lambda_sg.id]
   iam_instance_profile        = aws_iam_instance_profile.bastion_profile.name
 
   tags = {
@@ -265,6 +261,7 @@ resource "aws_instance" "bastion" {
   }
 }
 
+# Outputs
 output "s3_bucket_name" {
   value = aws_s3_bucket.converted_code_bucket.bucket
 }
