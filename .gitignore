@@ -24,4 +24,3 @@ dist-ssr
 *.sw?
 
 /src/config/firebase-config.js
-/Terraform/bation-key.pem

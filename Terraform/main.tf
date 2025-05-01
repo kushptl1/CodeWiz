@@ -9,6 +9,104 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/lambda_function.zip"
 }
 
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# VPC Setup
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_subnet" "public_subnet" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+}
+
+resource "aws_subnet" "private_subnet" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-east-1b"
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+
+resource "aws_route_table_association" "public_assoc" {
+  subnet_id      = aws_subnet.public_subnet.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "lambda_sg" {
+  name        = "lambda-sg"
+  description = "Allow Lambda and SSH access"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# DynamoDB Table
+resource "aws_dynamodb_table" "lambda_logs" {
+  name         = "lambda-logs"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LogID"
+
+  attribute {
+    name = "LogID"
+    type = "S"
+  }
+
+  tags = {
+    Name = "LambdaLogsTable"
+  }
+}
+
+# VPC Gateway Endpoint for S3
+resource "aws_vpc_endpoint" "s3_endpoint" {
+  vpc_id          = aws_vpc.main.id
+  service_name    = "com.amazonaws.us-east-1.s3"
+  route_table_ids = [aws_route_table.public.id]
+}
+
+# S3 Bucket for converted code
+resource "aws_s3_bucket" "converted_code_bucket" {
+  bucket         = "lambda-code-output-${random_id.suffix.hex}"
+  force_destroy  = true
+}
+
+resource "aws_s3_bucket_public_access_block" "block" {
+  bucket = aws_s3_bucket.converted_code_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 # IAM Role for Lambda Execution
 resource "aws_iam_role" "lambda_exec_role" {
   name = "lambda-basic-execution"
@@ -27,33 +125,13 @@ resource "aws_iam_role" "lambda_exec_role" {
   })
 }
 
-# Attach AWSLambdaBasicExecutionRole to allow CloudWatch logging
 resource "aws_iam_role_policy_attachment" "lambda_logs" {
   role       = aws_iam_role.lambda_exec_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Lambda Function Resource
-resource "aws_lambda_function" "my_lambda" {
-  function_name = "MyLambdaFunction"
-  filename      = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  handler       = "lambda_function.lambda_handler" # filename.function
-  runtime       = "python3.11"
-  role          = aws_iam_role.lambda_exec_role.arn
-  timeout       = 30
-  
- environment {
-    variables = {
-      S3_BUCKET_NAME = aws_s3_bucket.converted_code_bucket.bucket
-    }
-  }
-}
-
-
-## Add Permission for using bedrock
-resource "aws_iam_role_policy" "bedrock_invoke" {
-  name = "allow-bedrock-invoke"
+resource "aws_iam_role_policy" "lambda_invoke" {
+  name = "lambda-policy"
   role = aws_iam_role.lambda_exec_role.id
 
   policy = jsonencode({
@@ -61,41 +139,144 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
     Statement = [
       {
         Effect = "Allow",
-        Action = "bedrock:InvokeModel",
+        Action = ["bedrock:InvokeModel"],
         Resource = "arn:aws:bedrock:us-east-1::foundation-model/*"
-      }
-    ]
-  })
-}
-
-## Add S3 bucket 
-resource "aws_s3_bucket" "converted_code_bucket" {
-  bucket = "lambda-code-output-${random_id.suffix.hex}"
-  force_destroy = true
-}
-
-resource "random_id" "suffix" {
-  byte_length = 4
-}
-## Add IAM Permission to Lambda Role 
-resource "aws_iam_role_policy" "lambda_s3_write" {
-  name = "allow-s3-write"
-  role = aws_iam_role.lambda_exec_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
+      },
       {
         Effect = "Allow",
-        Action = [
-          "s3:PutObject"
-        ],
+        Action = ["dynamodb:PutItem"],
+        Resource = aws_dynamodb_table.lambda_logs.arn
+      },
+      {
+        Effect = "Allow",
+        Action = ["s3:PutObject"],
         Resource = "${aws_s3_bucket.converted_code_bucket.arn}/*"
       }
     ]
   })
 }
 
+# Lambda Function
+resource "aws_lambda_function" "my_lambda" {
+  function_name = "MyLambdaFunction"
+  filename      = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  handler       = "lambda_function.lambda_handler"
+  runtime       = "python3.11"
+  role          = aws_iam_role.lambda_exec_role.arn
+  timeout       = 30
+
+  environment {
+    variables = {
+      S3_BUCKET_NAME = aws_s3_bucket.converted_code_bucket.bucket
+      DYNAMODB_TABLE = aws_dynamodb_table.lambda_logs.name
+    }
+  }
+}
+
+# API Gateway to expose Lambda
+resource "aws_apigatewayv2_api" "lambda_api" {
+  name          = "lambda-api"
+  protocol_type = "HTTP"
+}
+
+resource "aws_lambda_permission" "apigw_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.my_lambda.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.lambda_api.execution_arn}/*/*"
+}
+
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id             = aws_apigatewayv2_api.lambda_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.my_lambda.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "lambda_route" {
+  api_id    = aws_apigatewayv2_api.lambda_api.id
+  route_key = "POST /convert"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_apigatewayv2_stage" "lambda_stage" {
+  api_id      = aws_apigatewayv2_api.lambda_api.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+# IAM Role and Policy for EC2 to access S3
+resource "aws_iam_role" "bastion_role" {
+  name = "ec2-bastion-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "bastion-instance-profile"
+  role = aws_iam_role.bastion_role.name
+}
+
+resource "aws_iam_role_policy" "bastion_s3_access" {
+  name = "bastion-s3-access"
+  role = aws_iam_role.bastion_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = ["s3:GetObject", "s3:ListBucket"],
+        Resource = [
+          aws_s3_bucket.converted_code_bucket.arn,
+          "${aws_s3_bucket.converted_code_bucket.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+# EC2 Bastion Host
+resource "aws_instance" "bastion" {
+  ami                         = "ami-0c02fb55956c7d316"
+  instance_type               = "t2.micro"
+  subnet_id                   = aws_subnet.public_subnet.id
+  vpc_security_group_ids      = [aws_security_group.lambda_sg.id]
+  associate_public_ip_address = true
+  key_name                    = "bastion-key"
+  iam_instance_profile        = aws_iam_instance_profile.bastion_profile.name
+
+  tags = {
+    Name = "bastion-host"
+  }
+}
+
 output "s3_bucket_name" {
   value = aws_s3_bucket.converted_code_bucket.bucket
+}
+
+output "dynamodb_table_name" {
+  value = aws_dynamodb_table.lambda_logs.name
+}
+
+output "bastion_public_ip" {
+  value = aws_instance.bastion.public_ip
+}
+
+output "api_gateway_url" {
+  value = aws_apigatewayv2_api.lambda_api.api_endpoint
 }
