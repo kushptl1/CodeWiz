@@ -1,188 +1,149 @@
-provider "aws" {
-  region = "us-east-1"
-}
+import json
+import boto3
+import re
+import os
+import uuid
+from datetime import datetime
 
-# Zip the lambda_function.py
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/lambda"
-  output_path = "${path.module}/lambda_function.zip"
-}
+# AWS clients
+bedrock = boto3.client('bedrock-runtime')
+s3 = boto3.client("s3")
+dynamodb = boto3.client("dynamodb")
 
-resource "random_id" "suffix" {
-  byte_length = 4
-}
+# Environment variables
+bucket_name = os.environ.get("S3_BUCKET_NAME")
+dynamodb_table = os.environ.get("DYNAMODB_TABLE")
 
-# VPC Setup
-resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-}
+def extract_code_block(text, language=None):
+    if not text:
+        return ""
+    match = re.search(r"Code:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    if language:
+        pattern = rf"```{language}(.*?)```"
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    fallback = re.search(r"```(.*?)```", text, re.DOTALL)
+    if fallback:
+        return fallback.group(1).strip()
+    return text.strip()
 
-resource "aws_subnet" "public_subnet" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "us-east-1a"
-  map_public_ip_on_launch = true
-}
+def get_bedrock_response(model_id, prompt):
+    if model_id.startswith("anthropic.claude"):
+        body = json.dumps({
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "anthropic_version": "bedrock-2023-05-31"
+        })
+    else:
+        raise ValueError("Unsupported model_id")
 
-resource "aws_subnet" "private_subnet" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "us-east-1b"
-}
+    response = bedrock.invoke_model(
+        body=body,
+        modelId=model_id,
+        accept="application/json",
+        contentType="application/json"
+    )
+    result = json.loads(response['body'].read())
+    try:
+        return result["content"][0]["text"]
+    except Exception as e:
+        print("Claude model response error:", result)
+        return ""
 
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.main.id
-}
+def log_to_dynamodb(log_id, user_id, timestamp):
+    try:
+        dynamodb.put_item(
+            TableName=dynamodb_table,
+            Item={
+                "LogID": {"S": log_id},
+                "UserID": {"S": user_id},
+                "Timestamp": {"S": timestamp}
+            }
+        )
+    except Exception as e:
+        print("Error writing to DynamoDB:", e)
 
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
+def lambda_handler(event, context):
+    try:
+        body = json.loads(event["body"]) if "body" in event else event
 
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }
-}
+        source_code = body.get("sourceCode")
+        source_lang = body.get("sourceLang", "").strip().lower()
+        target_lang = body.get("targetLang", "").strip().lower()
+        user_id = body.get("UserID", "").strip()
+        timestamp = datetime.utcnow().isoformat()
+        date_path = datetime.utcnow().strftime("%Y-%m-%d")
 
-resource "aws_route_table_association" "public_assoc" {
-  subnet_id      = aws_subnet.public_subnet.id
-  route_table_id = aws_route_table.public.id
-}
+        if not all([source_code, source_lang, target_lang, user_id]):
+            return {
+                "statusCode": 400,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({"message": "Missing one or more required fields."})
+            }
 
-resource "aws_security_group" "lambda_sg" {
-  name        = "lambda-sg"
-  description = "Allow Lambda access"
-  vpc_id      = aws_vpc.main.id
+        prompt = (
+            f"Convert the following {source_lang} code to {target_lang}:\n\n"
+            f"```{source_lang}\n{source_code}\n```\n\n"
+            f"Please reply with only the converted code, and prefix it with 'Code:'."
+        )
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
+        model_claude = "anthropic.claude-3-sonnet-20240229-v1:0"
+        response_claude = get_bedrock_response(model_claude, prompt)
 
-# DynamoDB Table
-resource "aws_dynamodb_table" "lambda_logs" {
-  name           = "lambda-logs"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "LogID"
+        if not response_claude:
+            raise ValueError("Claude response was empty.")
 
-  attribute {
-    name = "LogID"
-    type = "S"
-  }
+        converted_code = extract_code_block(response_claude, target_lang)
 
-  tags = {
-    Name = "LambdaLogsTable"
-  }
-}
+        # Save to S3
+        log_id = str(uuid.uuid4())
+        file_name = f"{user_id}_{timestamp}_{target_lang}_{log_id}.txt"
+        file_key = f"{user_id}/{date_path}/{file_name}"
+        file_content = (
+            f"UserID: {user_id}\n"
+            f"Timestamp: {timestamp}\n"
+            f"TargetLang: {target_lang}\n"
+            f"Code:\n{converted_code}"
+        )
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=file_key,
+            Body=file_content.encode("utf-8")
+        )
 
-# EC2 as Bastion Host in public subnet using existing key
-resource "aws_instance" "bastion" {
-  ami                         = "ami-0c02fb55956c7d316" # Amazon Linux 2 AMI in us-east-1
-  instance_type               = "t2.micro"
-  subnet_id                   = aws_subnet.public_subnet.id
-  vpc_security_group_ids      = [aws_security_group.lambda_sg.id]
-  associate_public_ip_address = true
-  key_name                    = "bastion-key" # Replace with your existing key name
+        # Save to DynamoDB
+        log_to_dynamodb(log_id, user_id, timestamp)
 
-  tags = {
-    Name = "bastion-host"
-  }
-}
-
-# IAM Role for Lambda Execution
-resource "aws_iam_role" "lambda_exec_role" {
-  name = "lambda-basic-execution"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Action = "sts:AssumeRole",
-        Effect = "Allow",
-        Principal = {
-          Service = "lambda.amazonaws.com"
+        return {
+            "statusCode": 200,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({
+                "converted_code": converted_code,
+                "s3_key": file_key
+            })
         }
-      }
-    ]
-  })
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({
+                "message": "Internal error",
+                "error": str(e)
+            })
+        }
+
+
+'''
+# TEST EVENT:
+{
+    "sourceLang": "python",
+    "targetLang": "java",
+    "sourceCode": "def greet():\n    print('Hello')",
+    "UserID": "user123"
 }
-
-resource "aws_iam_role_policy_attachment" "lambda_logs" {
-  role       = aws_iam_role.lambda_exec_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_lambda_function" "my_lambda" {
-  function_name = "MyLambdaFunction"
-  filename      = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  handler       = "lambda_function.lambda_handler"
-  runtime       = "python3.11"
-  role          = aws_iam_role.lambda_exec_role.arn
-  timeout       = 30
-
-  environment {
-    variables = {
-      S3_BUCKET_NAME = aws_s3_bucket.converted_code_bucket.bucket
-      DYNAMODB_TABLE = aws_dynamodb_table.lambda_logs.name
-    }
-  }
-  # Removed vpc_config block to allow public internet access for DynamoDB
-}
-
-resource "aws_iam_role_policy" "bedrock_invoke" {
-  name = "allow-bedrock-invoke"
-  role = aws_iam_role.lambda_exec_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = ["bedrock:InvokeModel"],
-        Resource = "arn:aws:bedrock:us-east-1::foundation-model/*"
-      },
-      {
-        Effect = "Allow",
-        Action = ["dynamodb:PutItem"],
-        Resource = aws_dynamodb_table.lambda_logs.arn
-      }
-    ]
-  })
-}
-
-resource "aws_s3_bucket" "converted_code_bucket" {
-  bucket = "lambda-code-output-${random_id.suffix.hex}"
-  force_destroy = true
-}
-
-resource "aws_iam_role_policy" "lambda_s3_write" {
-  name = "allow-s3-write"
-  role = aws_iam_role.lambda_exec_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = ["s3:PutObject"],
-        Resource = "${aws_s3_bucket.converted_code_bucket.arn}/*"
-      }
-    ]
-  })
-}
-
-output "s3_bucket_name" {
-  value = aws_s3_bucket.converted_code_bucket.bucket
-}
-
-output "dynamodb_table_name" {
-  value = aws_dynamodb_table.lambda_logs.name
-}
-
-output "bastion_public_ip" {
-  value = aws_instance.bastion.public_ip
-}
+'''
