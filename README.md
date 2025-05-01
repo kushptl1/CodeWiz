@@ -22,7 +22,7 @@ This repository contains a project named **CodeWiz**, a web application built wi
 
 The system architecture is as follows:
 
-![Architecture Diagram](/src/assets/Project.drawio.png.png)
+![Architecture Diagram](src/assets/Project.drawio.png)
 
 ### Flow
 
