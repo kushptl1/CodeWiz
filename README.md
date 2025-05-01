@@ -18,6 +18,12 @@ This repository contains a project named **CodeWiz**, a web application built wi
 
 **CodeWiz** is a web-based code refactoring tool that transforms code from one programming language to another using AI models hosted on **AWS Bedrock**. The system also includes **semantic code validation** using **SageMaker**'s **CodeBERT** model to ensure the quality and correctness of the generated code. All user actions are logged in **DynamoDB**, and **S3** is used for secure storage of generated code under each user's ID.
 
+### Architecture Diagram
+
+The system architecture is as follows:
+
+![Architecture Diagram](/src/assets/Project.drawio.png.png)
+
 ### Flow
 
 1. **Frontend (React App)**: The frontend communicates with the **AWS API Gateway**, which triggers a **Lambda function** to:
@@ -238,3 +244,4 @@ This will create the necessary AWS resources, including the Lambda function.
 ## License
 
 This project is licensed under the MIT License.
+
