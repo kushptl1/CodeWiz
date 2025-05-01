@@ -68,6 +68,18 @@ def log_to_dynamodb(log_id, user_id, timestamp):
         print("Error writing to DynamoDB:", e)
 
 def lambda_handler(event, context):
+    # Handle preflight OPTIONS request
+    if event.get("httpMethod") == "OPTIONS":
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"
+            },
+            "body": json.dumps("Preflight check OK")
+        }
+
     try:
         body = json.loads(event["body"]) if "body" in event else event
 
@@ -81,7 +93,11 @@ def lambda_handler(event, context):
         if not all([source_code, source_lang, target_lang, user_id]):
             return {
                 "statusCode": 400,
-                "headers": {"Access-Control-Allow-Origin": "*"},
+                "headers": {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Methods": "POST,OPTIONS"
+                },
                 "body": json.dumps({"message": "Missing one or more required fields."})
             }
 
@@ -120,7 +136,11 @@ def lambda_handler(event, context):
 
         return {
             "statusCode": 200,
-            "headers": {"Access-Control-Allow-Origin": "*"},
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"
+            },
             "body": json.dumps({
                 "converted_code": converted_code,
                 "s3_key": file_key
@@ -130,20 +150,13 @@ def lambda_handler(event, context):
     except Exception as e:
         return {
             "statusCode": 500,
-            "headers": {"Access-Control-Allow-Origin": "*"},
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"
+            },
             "body": json.dumps({
                 "message": "Internal error",
                 "error": str(e)
             })
         }
-
-
-'''
-# TEST EVENT:
-{
-    "sourceLang": "python",
-    "targetLang": "java",
-    "sourceCode": "def greet():\n    print('Hello')",
-    "UserID": "user123"
-}
-'''
