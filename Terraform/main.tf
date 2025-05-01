@@ -42,7 +42,14 @@ resource "aws_lambda_function" "my_lambda" {
   runtime       = "python3.11"
   role          = aws_iam_role.lambda_exec_role.arn
   timeout       = 30
+  
+ environment {
+    variables = {
+      S3_BUCKET_NAME = aws_s3_bucket.converted_code_bucket.bucket
+    }
+  }
 }
+
 
 ## Add Permission for using bedrock
 resource "aws_iam_role_policy" "bedrock_invoke" {
@@ -59,4 +66,36 @@ resource "aws_iam_role_policy" "bedrock_invoke" {
       }
     ]
   })
+}
+
+## Add S3 bucket 
+resource "aws_s3_bucket" "converted_code_bucket" {
+  bucket = "lambda-code-output-${random_id.suffix.hex}"
+  force_destroy = true
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+## Add IAM Permission to Lambda Role 
+resource "aws_iam_role_policy" "lambda_s3_write" {
+  name = "allow-s3-write"
+  role = aws_iam_role.lambda_exec_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:PutObject"
+        ],
+        Resource = "${aws_s3_bucket.converted_code_bucket.arn}/*"
+      }
+    ]
+  })
+}
+
+output "s3_bucket_name" {
+  value = aws_s3_bucket.converted_code_bucket.bucket
 }
